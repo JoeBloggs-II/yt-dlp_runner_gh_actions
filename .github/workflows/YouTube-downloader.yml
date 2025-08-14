@@ -1,108 +1,268 @@
-name: Download YouTube Video with Login
+name: Generate 10GiB Zip (zlib-only, zip64)
 
 on:
-  push:
-    paths:
-      - 'URL.txt'
   workflow_dispatch:
-  repository_dispatch:
-    types: [yt-download-request]
 
 jobs:
-  download:
+  build-and-run:
     runs-on: ubuntu-latest
-
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v3
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-    - name: Setup Node.js
-      uses: actions/setup-node@v3
-      with:
-        node-version: 20
+      - name: Install zlib dev
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
 
-    - name: Install Playwright and dependencies
-      run: |
-        npm install -D playwright
-        npx playwright install --with-deps
+      - name: Write C++ program (zip64 using raw zlib deflate)
+        run: |
+          cat > build_generate_zip.cpp <<'EOF'
+          #include <iostream>
+          #include <fstream>
+          #include <vector>
+          #include <string>
+          #include <cstdint>
+          #include <cstring>
+          #include <zlib.h>
 
-    - name: Install yt-dlp
-      run: |
-        sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
-        sudo chmod a+rx /usr/local/bin/yt-dlp
+          // Create a valid zip64 archive with one deflated file, streaming compressed data.
+          // The produced zip is small; when extracted it will expand to TARGET_SIZE bytes.
 
-    - name: Install Python and conversion tools
-      run: |
-        sudo apt update
-        sudo apt install -y python3-pip
-        pip install playwright python-dotenv
+          static void write_le(std::ostream &out, uint16_t v) {
+              unsigned char b[2];
+              b[0] = v & 0xff; b[1] = (v >> 8) & 0xff;
+              out.write((char*)b, 2);
+          }
+          static void write_le(std::ostream &out, uint32_t v) {
+              unsigned char b[4];
+              b[0] = v & 0xff; b[1] = (v >> 8) & 0xff; b[2] = (v >> 16) & 0xff; b[3] = (v >> 24) & 0xff;
+              out.write((char*)b, 4);
+          }
+          static void write_le64(std::ostream &out, uint64_t v) {
+              unsigned char b[8];
+              for (int i=0;i<8;i++) b[i] = (v >> (8*i)) & 0xff;
+              out.write((char*)b, 8);
+          }
 
-    - name: Prepare URL list
-      run: |
-        if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-          echo "${{ github.event.client_payload.url }}" > URL.txt
-        fi
+          int main() {
+              const uint64_t TARGET_SIZE = uint64_t(10) * 1024ULL * 1024ULL * 1024ULL; // 10 GiB
+              const size_t CHUNK_SIZE = 1024 * 1024; // 1 MiB input chunks of 'A'
+              const std::string ZIP_NAME = "10GB_all_A.zip";
+              const std::string ENTRY_NAME = "bigA.txt";
 
-    - name: Run Playwright login and export cookies
-      env:
-        LOGIN_EMAIL: ${{ secrets.LOGIN_EMAIL }}
-        LOGIN_PASSWORD: ${{ secrets.LOGIN_PASSWORD }}
-      run: |
-        cat << 'EOF' > login.mjs
-        import { chromium } from 'playwright';
-        import fs from 'fs';
+              std::ofstream out(ZIP_NAME, std::ios::binary);
+              if (!out) { std::cerr << "Failed to open output\n"; return 1; }
 
-        const EMAIL = process.env.LOGIN_EMAIL;
-        const PASSWORD = process.env.LOGIN_PASSWORD;
+              // --- LOCAL FILE HEADER (with placeholders and ZIP64 extra) ---
+              // local file header signature
+              write_le(out, 0x0403); // first half of signature (will write full with write_le 32)
+              write_le(out, 0x4b50);
+              // write version needed (45 for zip64), general purpose flag (bit 3 set -> data descriptor), compression method (8 deflate)
+              write_le(out, (uint16_t)45); // version needed to extract
+              write_le(out, (uint16_t) (1<<3)); // general purpose bit flag - bit 3 indicates data descriptor used
+              write_le(out, (uint16_t) 8); // deflate
+              // mod time/date (set zero)
+              write_le(out, (uint16_t)0);
+              write_le(out, (uint16_t)0);
+              // crc32 (0 for now)
+              write_le(out, (uint32_t)0);
+              // compressed size & uncompressed size (set to 0xFFFFFFFF to indicate zip64)
+              write_le(out, (uint32_t)0xFFFFFFFF);
+              write_le(out, (uint32_t)0xFFFFFFFF);
+              // filename length & extra field length (we will include zip64 extra in local header)
+              write_le(out, (uint16_t) ENTRY_NAME.size());
+              // ZIP64 extra: header id 0x0001, size 16 (8 + 8) for uncompressed + compressed sizes
+              // local extra field length = 4 (header id+size) + 16
+              write_le(out, (uint16_t)(4 + 16));
+              // filename
+              out.write(ENTRY_NAME.data(), ENTRY_NAME.size());
+              // local extra: zip64 extra header id and data
+              write_le(out, (uint16_t)0x0001); // header id zip64
+              write_le(out, (uint16_t)16);     // data size
+              // write uncompressed size (8) then compressed size (8) as placeholders (we'll fill actual compressed size later in data descriptor and central dir)
+              write_le64(out, TARGET_SIZE);
+              write_le64(out, 0); // compressed size unknown yet - but include 0 as placeholder
 
-        const run = async () => {
-          const browser = await chromium.launch({ headless: true });
-          const context = await browser.newContext();
-          const page = await context.newPage();
+              // Save local header offset for central directory
+              uint64_t local_header_offset = out.tellp();
+              // (Note: local_header_offset currently points right after the local header. For central directory we need offset to beginning of local header.)
+              // Calculate beginning of local header offset:
+              uint64_t begin_local_header = local_header_offset - (4 + 2 + 2 + 2 + 2 + 2 + 4 + 4 + 4 + 2 + 2 + ENTRY_NAME.size() + 4 + 16);
 
-          await page.goto('https://www.youtube.com/');
-          await page.getByRole('link', { name: 'Sign in' }).click();
-          await page.getByRole('textbox', { name: 'Email or phone' }).fill(EMAIL);
-          await page.getByRole('button', { name: /^Next$/ }).click();
-          await page.waitForTimeout(2000);
-          await page.screenshot({ path: 'before-username.png' });
-          await page.getByRole('textbox', { name: 'Username' }).fill(EMAIL);
-          await page.getByRole('button', { name: /^Next$/ }).click();
-          await page.getByRole('textbox', { name: 'Password' }).fill(PASSWORD);
-          await page.getByRole('button', { name: /^Verify$/ }).click();
+              // --- Prepare zlib deflate stream ---
+              z_stream zs;
+              std::memset(&zs, 0, sizeof(zs));
+              int ret = deflateInit2(&zs, Z_BEST_COMPRESSION, Z_DEFLATED, -MAX_WBITS, DEF_MEM_LEVEL, Z_DEFAULT_STRATEGY);
+              if (ret != Z_OK) { std::cerr << "deflateInit2 failed\n"; return 1; }
 
-          await page.waitForURL('https://www.youtube.com/*');
+              // We'll compute CRC32 as we go
+              uLong crc = crc32(0L, Z_NULL, 0);
 
-          const cookies = await context.cookies();
-          const netscape = cookies.map(c => [
-            c.domain.startsWith('.') ? c.domain : '.' + c.domain,
-            'TRUE',
-            c.path,
-            c.secure ? 'TRUE' : 'FALSE',
-            (c.expires && c.expires > Date.now() / 1000 ? Math.floor(c.expires) : Math.floor(Date.now() / 1000 + 3600)),
-            c.name,
-            c.value
-          ].join('\t')).join('\n');
+              // Buffering
+              std::vector<unsigned char> inbuf(CHUNK_SIZE, 'A');
+              uint64_t remaining = TARGET_SIZE;
+              std::vector<unsigned char> outbuf(1 << 16); // 64 KiB output buffer
 
-          fs.writeFileSync('cookies.txt', '# Netscape HTTP Cookie File\n' + netscape);
-          await browser.close();
-        };
+              // Stream compress
+              while (remaining > 0) {
+                  size_t to_write = remaining >= CHUNK_SIZE ? CHUNK_SIZE : (size_t)remaining;
+                  // feed zs
+                  zs.next_in = inbuf.data();
+                  zs.avail_in = (uInt)to_write;
+                  crc = crc32(crc, inbuf.data(), (uInt)to_write);
 
-        run();
-        EOF
+                  int flush = (remaining <= CHUNK_SIZE) ? Z_FINISH : Z_NO_FLUSH;
 
-        node login.mjs
+                  do {
+                      zs.next_out = outbuf.data();
+                      zs.avail_out = outbuf.size();
+                      int zret = deflate(&zs, flush);
+                      if (zret == Z_STREAM_ERROR) { std::cerr << "deflate error\n"; deflateEnd(&zs); return 1; }
+                      size_t have = outbuf.size() - zs.avail_out;
+                      if (have) out.write((char*)outbuf.data(), have);
+                  } while (zs.avail_out == 0);
 
-    - name: Create output folder
-      run: mkdir -p videos
+                  remaining -= to_write;
+                  double done_gb = double(TARGET_SIZE - remaining) / (1024.0 * 1024.0 * 1024.0);
+                  std::cout << "\rCompressed stream progress: " << done_gb << " GiB" << std::flush;
+              }
 
-    - name: Download YouTube video(s) with yt-dlp
-      run: |
-        yt-dlp --cookies cookies.txt -f "bestvideo+bestaudio/best" --merge-output-format mp4 \
-          -a URL.txt -o "videos/%(playlist_index)s - %(title)s.%(ext)s"
+              // finalize
+              deflateEnd(&zs);
+              std::cout << "\n";
 
-    - name: Upload downloaded video(s) as artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: downloaded-video
-        path: videos/
+              // We need the compressed size: file current position minus position right after local header
+              uint64_t file_end_pos = out.tellp();
+
+              // compressed data spans from 'local_header_offset' up to file_end_pos. But recall local_header_offset is after header; compute compressed_size:
+              uint64_t compressed_size = file_end_pos - local_header_offset;
+              uint64_t uncompressed_size = TARGET_SIZE;
+
+              // --- Write Data Descriptor (with signature) - ZIP64 form: signature + crc32 + comp size (8) + uncomp size (8) ---
+              // Signature
+              write_le(out, 0x0807); write_le(out, 0x4b50); // 0x08074b50
+              // CRC32
+              write_le(out, (uint32_t)crc);
+              // compressed size (8)
+              write_le64(out, compressed_size);
+              // uncompressed size (8)
+              write_le64(out, uncompressed_size);
+
+              uint64_t central_dir_offset = out.tellp();
+
+              // --- CENTRAL DIRECTORY HEADER (zip64) ---
+              // central dir file header signature
+              write_le(out, 0x0201); write_le(out, 0x4b50); // 0x02014b50
+              // version made by
+              write_le(out, (uint16_t)45);
+              // version needed to extract
+              write_le(out, (uint16_t)45);
+              // flags
+              write_le(out, (uint16_t)(1<<3));
+              // compression
+              write_le(out, (uint16_t)8);
+              // mod time/date
+              write_le(out, (uint16_t)0); write_le(out, (uint16_t)0);
+              // crc32
+              write_le(out, (uint32_t)crc);
+              // compressed size (set 0xFFFFFFFF to indicate zip64)
+              write_le(out, (uint32_t)0xFFFFFFFF);
+              // uncompressed size (0xFFFFFFFF)
+              write_le(out, (uint32_t)0xFFFFFFFF);
+              // filename length
+              write_le(out, (uint16_t)ENTRY_NAME.size());
+              // extra length - we'll include zip64 extra with (uncompressed 8, compressed 8, offset 8) => size 24 + header 4 => 28
+              write_le(out, (uint16_t)(4 + 24));
+              // file comment length
+              write_le(out, (uint16_t)0);
+              // disk number start
+              write_le(out, (uint16_t)0);
+              // internal file attr
+              write_le(out, (uint16_t)0);
+              // external file attr
+              write_le(out, (uint32_t)0);
+              // relative offset of local header (set to 0xFFFFFFFF to indicate zip64)
+              write_le(out, (uint32_t)0xFFFFFFFF);
+              // filename
+              out.write(ENTRY_NAME.data(), ENTRY_NAME.size());
+              // extra: zip64 extra header id + size
+              write_le(out, (uint16_t)0x0001);
+              write_le(out, (uint16_t)24); // data size
+              // zip64 fields: uncompressed size (8), compressed size (8), local header offset (8)
+              write_le64(out, uncompressed_size);
+              write_le64(out, compressed_size);
+              write_le64(out, begin_local_header);
+
+              uint64_t central_dir_end = out.tellp();
+
+              // --- ZIP64 END OF CENTRAL DIRECTORY RECORD ---
+              // signature
+              write_le(out, 0x0606); write_le(out, 0x4b50); // 0x06064b50
+              // size of zip64 end of central dir record (size of remaining fields) = 44 (version etc) + ext sizes = we will write 44
+              write_le64(out, (uint64_t)44);
+              // version made by & version needed
+              write_le(out, (uint16_t)45);
+              write_le(out, (uint16_t)45);
+              // number of this disk
+              write_le(out, (uint32_t)0);
+              // number of the disk with the start of the central directory
+              write_le(out, (uint32_t)0);
+              // total number of entries on this disk
+              write_le64(out, (uint64_t)1);
+              // total number of entries
+              write_le64(out, (uint64_t)1);
+              // size of central directory
+              write_le64(out, (uint64_t)(central_dir_end - central_dir_offset));
+              // offset of start of central directory with respect to the starting disk number
+              write_le64(out, (uint64_t)central_dir_offset);
+
+              // --- ZIP64 END OF CENTRAL DIRECTORY LOCATOR ---
+              // signature
+              write_le(out, 0x0706); write_le(out, 0x4b50); // 0x07064b50
+              // number of the disk with the start of the zip64 end of central dir
+              write_le(out, (uint32_t)0);
+              // relative offset of the zip64 end of central directory record
+              write_le64(out, (uint64_t)central_dir_end);
+              // total number of disks
+              write_le(out, (uint32_t)1);
+
+              // --- END OF CENTRAL DIRECTORY RECORD (with placeholders 0xFFFF and zip64 locator present) ---
+              // signature
+              write_le(out, 0x0605); write_le(out, 0x4b50); // 0x06054b50
+              // number of this disk
+              write_le(out, (uint16_t)0xFFFF);
+              // number of the disk with the start of the central directory
+              write_le(out, (uint16_t)0xFFFF);
+              // total number of entries on this disk
+              write_le(out, (uint16_t)0xFFFF);
+              // total number of entries
+              write_le(out, (uint16_t)0xFFFF);
+              // size of central directory
+              write_le(out, (uint32_t)0xFFFFFFFF);
+              // offset of start of central directory
+              write_le(out, (uint32_t)0xFFFFFFFF);
+              // comment length
+              write_le(out, (uint16_t)0);
+
+              out.close();
+
+              std::cout << "Wrote " << ZIP_NAME << " (compressed " << compressed_size << " bytes; will expand to " << uncompressed_size << " bytes when unzip)\n";
+              std::cout << "Note: the archive is zip64. Use a modern unzip tool that supports zip64.\n";
+              return 0;
+          }
+          EOF
+
+      - name: Compile
+        run: g++ build_generate_zip.cpp -O2 -lz -o build_generate_zip
+
+      - name: Run generator (creates 10GB_all_A.zip)
+        run: ./build_generate_zip
+
+      - name: List artifact size
+        run: ls -lh 10GB_all_A.zip || true
+
+      - name: Upload zip as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 10GB_all_A
+          path: 10GB_all_A.zip
+          retention-days: 5
