@@ -102,7 +102,9 @@ jobs:
       with:
         name: downloaded-video
         path: videos/
+        
     - name : Upload screenshot as artifact
+      if: always()
       uses: actions/upload-artifact@v4
       with:
         name: after-email.png
