@@ -65,6 +65,13 @@ jobs:
           await page.getByRole('textbox', { name: 'Email or phone' }).fill(EMAIL);
           await page.getByRole('button', { name: /^Next$/ }).click();
           await page.waitForTimeout(2000);
+          
+          const button = page.locator('link:has-text("Try again)'
+          
+          if (await button.isVisible()) {
+            await button.click();
+          }
+          
           await page.screenshot({ path: 'after-email.png' });
 
           await page.waitForURL('https://www.youtube.com/*');
