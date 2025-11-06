@@ -65,11 +65,7 @@ jobs:
           await page.getByRole('textbox', { name: 'Email or phone' }).fill(EMAIL);
           await page.getByRole('button', { name: /^Next$/ }).click();
           await page.waitForTimeout(2000);
-          await page.screenshot({ path: 'before-username.png' });
-          await page.getByRole('textbox', { name: 'Username' }).fill(EMAIL);
-          await page.getByRole('button', { name: /^Next$/ }).click();
-          await page.getByRole('textbox', { name: 'Password' }).fill(PASSWORD);
-          await page.getByRole('button', { name: /^Verify$/ }).click();
+          await page.screenshot({ path: 'after-email.png' });
 
           await page.waitForURL('https://www.youtube.com/*');
 
@@ -106,3 +102,8 @@ jobs:
       with:
         name: downloaded-video
         path: videos/
+    - name : Upload screenshot as artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: after-email.png
+        path: after-email.png
