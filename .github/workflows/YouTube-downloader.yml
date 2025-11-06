@@ -66,7 +66,7 @@ jobs:
           await page.getByRole('button', { name: /^Next$/ }).click();
           await page.waitForTimeout(2000);
           
-          const button = page.locator('link:has-text("Try again)'
+          const button = page.locator('link:has-text("Try again")')
           
           if (await button.isVisible()) {
             await button.click();
