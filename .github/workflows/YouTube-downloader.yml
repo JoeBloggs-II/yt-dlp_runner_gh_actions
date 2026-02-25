@@ -56,8 +56,12 @@ jobs:
         const PASSWORD = process.env.LOGIN_PASSWORD;
 
         const run = async () => {
-          const browser = await chromium.launch({ headless: true });
-          const context = await browser.newContext();
+          
+          const context = await chromium.launchPersistentContext('./profile', {
+            headless: false,
+            channel: 'chrome',
+            args: ['--disable-blink-features=AutomationControlled']
+          });
           const page = await context.newPage();
 
           await page.goto('https://www.youtube.com/');
