@@ -43,6 +43,9 @@ jobs:
           echo "${{ github.event.client_payload.url }}" > URL.txt
         fi
 
+    - name: Install virtual display
+      run: sudo apt-get install -y xvfb
+
     - name: Run Playwright login and export cookies
       env:
         LOGIN_EMAIL: ${{ secrets.LOGIN_EMAIL }}
@@ -101,7 +104,7 @@ jobs:
         run();
         EOF
 
-        node login.mjs
+        xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" node login.mjs
 
     - name: Create output folder
       run: mkdir -p videos
